@@ -1,0 +1,20 @@
+# config.toml 範例 (can configure 1 to 4 servers)
+[[servers]]
+id = "Server A"
+host = "192.168.0.123"       # IP 或 FQDN
+port = 1433
+username = "sa"
+password = "PasswordHere"
+filter_elapsed_ms = 1000     # 預設：只顯示執行超過 1000 毫秒的語法
+alert_elapsed_ms = 5000      # 警告條件：超過 5000 毫秒亮紅框並寫入 Log
+default_interval_sec = 10    # 預設每 10 秒查詢一次
+
+[[servers]]
+id = "Server B"
+host = "192.168.0.23"
+port = 1433
+username = "sa"
+password = "PasswordHere"
+filter_elapsed_ms = 3000
+alert_elapsed_ms = 10000
+default_interval_sec = 10    # 這台可以設定不同的預設更新頻率

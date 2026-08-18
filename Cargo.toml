@@ -1,0 +1,20 @@
+[package]
+name = "MonitorSQL"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.27"            # GUI 框架
+egui_extras = "0.27"       # 支援固定表頭的 Table
+tokio = { version = "1", features = ["full"] } # 非同步處理
+tiberius = { version = "0.12", features = ["chrono"] }          # SQL Server 驅動
+tokio-util = { version = "0.7", features = ["compat"] }
+serde = { version = "1.0", features = ["derive"] } # 設定檔解析
+toml = "0.8"               # 讀取 TOML 格式
+chrono = "0.4"             # 時間與 Log 處理
+
+# 最佳化編譯出的 EXE 檔案大小
+[profile.release]
+opt-level = "z"            # 針對檔案大小進行最佳化
+lto = true                 # 啟用跨模組最佳化 (Link Time Optimization)
+strip = true               # 移除二進制檔案中的除錯符號
