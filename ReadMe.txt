@@ -70,6 +70,13 @@ AlertLogViewer/
 └── src/
     └── main.rs              # 2. 程式入口與 GUI 啟動
 
+
+SnapshotViewer/
+├── Cargo.toml               # 1. 專案依賴套件設定
+└── src/
+    └── main.rs              # 2. 程式入口與 GUI 啟動
+
+
 --------
 編譯方式
 --------
