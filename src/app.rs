@@ -14,6 +14,8 @@ use crate::db;
 
 fn default_port() -> u16 { 1433 }
 fn default_alert_worker_percent() -> u64 { 40 } 
+fn default_requests_snapshot() -> u64 { 0 } 
+fn default_pause_snapshot() -> u64 { 0 } 
 
 #[derive(Deserialize, Clone)]
 pub struct AppConfig {
@@ -32,6 +34,10 @@ pub struct ServerConfig {
     pub alert_elapsed_ms: u64,
     #[serde(default = "default_alert_worker_percent")]
     pub alert_worker_percent: u64,
+    #[serde(default = "default_requests_snapshot")]
+    pub requests_snapshot: u64,
+    #[serde(default = "default_pause_snapshot")] 
+    pub pause_snapshot: u64,
     pub default_interval_sec: u64,
 }
 
@@ -42,6 +48,8 @@ pub struct ServerController {
     pub filter_elapsed_ms: Arc<AtomicU64>,
     pub alert_elapsed_ms: Arc<AtomicU64>,
     pub alert_worker_percent: Arc<AtomicU64>, 
+    pub requests_snapshot: Arc<AtomicU64>, 
+    pub pause_snapshot: Arc<AtomicBool>, 
 }
 
 #[derive(Clone, Default)]
@@ -93,6 +101,7 @@ pub struct MonitorApp {
     receivers: Vec<mpsc::Receiver<DashboardData>>,
     selected_session: Option<SessionData>,
     _rt: tokio::runtime::Runtime,
+    unacknowledged_alert: bool,
 }
 
 fn draw_badge(ui: &mut egui::Ui, text: &str, bg_color: egui::Color32, text_color: egui::Color32) {
@@ -105,7 +114,6 @@ fn draw_badge(ui: &mut egui::Ui, text: &str, bg_color: egui::Color32, text_color
         });
 }
 
-// 實作快照寫入功能
 fn write_snapshot_log(server_id: &str, data: &DashboardData) {
     let now = Local::now();
     let file_name = now.format("snapshot_log_%Y%m%d.log").to_string();
@@ -168,6 +176,8 @@ impl MonitorApp {
                 filter_elapsed_ms: Arc::new(AtomicU64::new(srv_cfg.filter_elapsed_ms)),
                 alert_elapsed_ms: Arc::new(AtomicU64::new(srv_cfg.alert_elapsed_ms)),
                 alert_worker_percent: Arc::new(AtomicU64::new(srv_cfg.alert_worker_percent)),
+                requests_snapshot: Arc::new(AtomicU64::new(srv_cfg.requests_snapshot)),
+                pause_snapshot: Arc::new(AtomicBool::new(srv_cfg.pause_snapshot != 0)),
             };
 
             controllers.push(controller.clone());
@@ -187,6 +197,7 @@ impl MonitorApp {
             receivers,
             selected_session: None,
             _rt: rt,
+            unacknowledged_alert: false,
         }
     }
 }
@@ -195,10 +206,39 @@ impl eframe::App for MonitorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
+        let mut any_alert_this_tick = false;
+        
         for (i, rx) in self.receivers.iter_mut().enumerate() {
             while let Ok(data) = rx.try_recv() {
+                let snap_threshold = self.controllers[i].requests_snapshot.load(Ordering::Relaxed);
+                let is_snap_paused = self.controllers[i].pause_snapshot.load(Ordering::Relaxed);
+                
+                if snap_threshold > 0 && data.raw_session_count as u64 >= snap_threshold {
+                    if !is_snap_paused {
+                        write_snapshot_log(&self.server_configs[i].id, &data);
+                    }
+                }
+
                 self.server_data[i] = data;
             }
+        }
+
+        for data in &self.server_data {
+            if data.is_alerting {
+                any_alert_this_tick = true;
+                break;
+            }
+        }
+
+        let is_focused = ctx.input(|i| i.focused);
+
+        if is_focused {
+            self.unacknowledged_alert = false;
+        } else if any_alert_this_tick && !self.unacknowledged_alert {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+            self.unacknowledged_alert = true;
+        } else if !any_alert_this_tick {
+            self.unacknowledged_alert = false;
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -237,116 +277,165 @@ impl eframe::App for MonitorApp {
                             .show(ui, |ui| {
                                 ui.set_width(col_width - 15.0);
                                 ui.vertical(|ui| {
+                                    
                                     ui.horizontal(|ui| {
-                                        ui.heading(egui::RichText::new(format!("🖥️ {}", config.id)).color(egui::Color32::from_rgb(33, 37, 41)));
+                                        ui.heading(egui::RichText::new(format!("🖥 {}", config.id)).color(egui::Color32::from_rgb(33, 37, 41)));
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            
-                                            // 快照按鈕 (使用 right_to_left 排版，所以先加入的元件會在最右邊)
                                             if ui.button("📸 快照").clicked() {
                                                 write_snapshot_log(&config.id, data);
                                             }
-                                            
-                                            // 原本的時間標籤，會出現在按鈕的左邊
                                             ui.label(egui::RichText::new(format!("🕒 {}", data.capture_time)).color(egui::Color32::GRAY));
                                         });
                                     });
                                     
                                     ui.separator();
                                     
-                                    ui.horizontal(|ui| {
-                                        let item_width = (col_width - 100.0) / 5.0; 
-                                        
-                                        ui.allocate_ui_with_layout(egui::vec2(item_width, 50.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-                                            ui.label(egui::RichText::new("Workers").strong());
-                                            ui.strong(format!("{} / {}", data.active_workers, data.max_threads));
+                                    // 【最聰明的作法：使用 Scope 關閉自動間距，我們自己精準控制一切寬度】
+                                    ui.scope(|ui| {
+                                        // 關閉 egui 的自動水平間距
+                                        ui.spacing_mut().item_spacing.x = 0.0;
+
+                                        ui.horizontal(|ui| {
+                                            let total_avail = ui.available_width();
+                                            // 5 條分隔線，每條固定佔用 12.0px (含左右空間)
+                                            let sep_width = 12.0; 
+                                            // 剩下的寬度全部拿來依比例分配，保證 1px 都不會溢出
+                                            let usable_width = (total_avail - (5.0 * sep_width)).max(0.0);
                                             
-                                            let current_worker_pct = if data.max_threads > 0 {
-                                                ((data.active_workers as f64 / data.max_threads as f64) * 100.0) as u64
-                                            } else { 0 };
-                                            let alert_worker_pct = ctrl.alert_worker_percent.load(Ordering::Relaxed);
-                                            
-                                            let pct_color = if current_worker_pct >= alert_worker_pct {
-                                                egui::Color32::RED
-                                            } else {
-                                                egui::Color32::from_rgb(40, 167, 69)
+                                            let w_workers = (usable_width * 0.20).floor(); 
+                                            let w_conns   = (usable_width * 0.15).floor(); 
+                                            let w_ple     = (usable_width * 0.15).floor(); 
+                                            let w_temp    = (usable_width * 0.15).floor(); 
+                                            let w_trans   = (usable_width * 0.15).floor(); 
+                                            let w_req     = usable_width - w_workers - w_conns - w_ple - w_temp - w_trans; 
+
+                                            // 輔助閉包：用來畫出精準佔用 12px 的分隔線
+                                            let draw_sep = |ui: &mut egui::Ui| {
+                                                // 【修改】加入 egui::Direction::TopDown 解決編譯錯誤
+                                                ui.allocate_ui_with_layout(egui::vec2(sep_width, 50.0), egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
+                                                    ui.separator();
+                                                });
                                             };
-                                            ui.label(egui::RichText::new(&data.workers_percent).color(pct_color).strong());
-                                        });
-                                        ui.separator();
-                                        ui.allocate_ui_with_layout(egui::vec2(item_width, 50.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-                                            ui.label(egui::RichText::new("Conns").strong());
-                                            ui.add_space(3.0);
-                                            draw_badge(ui, &data.conn_logical.to_string(), egui::Color32::from_rgb(66, 133, 244), egui::Color32::WHITE);
-                                        });
-                                        ui.separator();
-                                        ui.allocate_ui_with_layout(egui::vec2(item_width, 50.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-                                            ui.label(egui::RichText::new("PLE").strong());
-                                            ui.add_space(3.0);
-                                            draw_badge(ui, &data.page_life_expectancy.to_string(), egui::Color32::from_rgb(52, 168, 83), egui::Color32::WHITE);
-                                        });
-                                        ui.separator();
-                                        ui.allocate_ui_with_layout(egui::vec2(item_width, 50.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-                                            ui.label(egui::RichText::new("Temp Tbls").strong());
-                                            ui.add_space(3.0);
-                                            ui.strong(data.active_temp_tables.to_string());
-                                        });
-                                        ui.separator();
-                                        ui.allocate_ui_with_layout(egui::vec2(item_width, 50.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-                                            ui.label(egui::RichText::new("Trans").strong());
-                                            ui.add_space(3.0);
-                                            ui.strong(data.transactions.to_string());
+                                            
+                                            // 1. Workers
+                                            ui.allocate_ui_with_layout(egui::vec2(w_workers, 50.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                                                ui.add(egui::Label::new(egui::RichText::new("Workers").strong()).wrap(false).truncate(true));
+                                                ui.strong(format!("{} / {}", data.active_workers, data.max_threads));
+                                                
+                                                let current_worker_pct = if data.max_threads > 0 {
+                                                    ((data.active_workers as f64 / data.max_threads as f64) * 100.0) as u64
+                                                } else { 0 };
+                                                let alert_worker_pct = ctrl.alert_worker_percent.load(Ordering::Relaxed);
+                                                
+                                                let pct_color = if current_worker_pct >= alert_worker_pct {
+                                                    egui::Color32::RED
+                                                } else {
+                                                    egui::Color32::from_rgb(40, 167, 69)
+                                                };
+                                                ui.label(egui::RichText::new(&data.workers_percent).color(pct_color).strong());
+                                            });
+                                            
+                                            draw_sep(ui);
+                                            
+                                            // 2. Conns
+                                            ui.allocate_ui_with_layout(egui::vec2(w_conns, 50.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                                                ui.add(egui::Label::new(egui::RichText::new("Conns").strong()).wrap(false).truncate(true));
+                                                ui.add_space(3.0);
+                                                draw_badge(ui, &data.conn_logical.to_string(), egui::Color32::from_rgb(66, 133, 244), egui::Color32::WHITE);
+                                            });
+                                            
+                                            draw_sep(ui);
+                                            
+                                            // 3. PLE
+                                            ui.allocate_ui_with_layout(egui::vec2(w_ple, 50.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                                                ui.add(egui::Label::new(egui::RichText::new("PLE").strong()).wrap(false).truncate(true));
+                                                ui.add_space(3.0);
+                                                draw_badge(ui, &data.page_life_expectancy.to_string(), egui::Color32::from_rgb(52, 168, 83), egui::Color32::WHITE);
+                                            });
+                                            
+                                            draw_sep(ui);
+                                            
+                                            // 4. Temp Tbls
+                                            ui.allocate_ui_with_layout(egui::vec2(w_temp, 50.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                                                ui.add(egui::Label::new(egui::RichText::new("Temp Tbls").strong()).wrap(false).truncate(true));
+                                                ui.add_space(3.0);
+                                                ui.strong(data.active_temp_tables.to_string());
+                                            });
+                                            
+                                            draw_sep(ui);
+                                            
+                                            // 5. Trans
+                                            ui.allocate_ui_with_layout(egui::vec2(w_trans, 50.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                                                ui.add(egui::Label::new(egui::RichText::new("Trans").strong()).wrap(false).truncate(true));
+                                                ui.add_space(3.0);
+                                                ui.strong(data.transactions.to_string());
+                                            });
+                                            
+                                            draw_sep(ui);
+                                            
+                                            // 6. Req Sessions
+                                            ui.allocate_ui_with_layout(egui::vec2(w_req, 50.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                                                ui.add(egui::Label::new(egui::RichText::new("Req. Sessions").strong().color(egui::Color32::from_rgb(22, 101, 192))).wrap(false).truncate(true));
+                                                ui.add_space(3.0);
+                                                ui.strong(data.raw_session_count.to_string());
+                                            });
                                         });
                                     });
 
                                     ui.separator();
 
-                                    ui.horizontal(|ui| {
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!("Request Sessions: {}", data.raw_session_count))
-                                                    .strong()
-                                                    .color(egui::Color32::from_rgb(22, 101, 192))
-                                            );
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        ui.spacing_mut().item_spacing.y = 8.0; 
+                                        
+                                        let is_paused = ctrl.is_paused.load(Ordering::Relaxed);
+                                        let btn_text = if is_paused { 
+                                            egui::RichText::new("▶ 啟動監控").color(egui::Color32::WHITE).strong()
+                                        } else { 
+                                            egui::RichText::new("⏸ 暫停監控") 
+                                        };
+                                        
+                                        let mut btn = egui::Button::new(btn_text);
+                                        if is_paused {
+                                            btn = btn.fill(egui::Color32::from_rgb(220, 53, 69)); 
+                                        }
 
-                                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true), |ui| {
-                                                ui.spacing_mut().item_spacing.x = 10.0;
-                                                
-                                                // 1. 啟動 / 暫停按鈕
-                                                let is_paused = ctrl.is_paused.load(Ordering::Relaxed);
-                                                let btn_text = if is_paused { "▶ 啟動" } else { "⏸ 暫停" };
-                                                if ui.button(btn_text).clicked() {
-                                                    ctrl.is_paused.store(!is_paused, Ordering::Relaxed);
-                                                }
-                                                
-                                                // 2. Interval (獨立的綠色風格)
-                                                ui.scope(|ui| {
-                                                    ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_rgb(209, 231, 221);
-                                                    ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_rgb(163, 207, 187);
-                                                    ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_rgb(117, 183, 152);
-                                                    ui.visuals_mut().widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(15, 81, 50);
-                                                    ui.visuals_mut().widgets.hovered.fg_stroke.color = egui::Color32::from_rgb(15, 81, 50);
+                                        if ui.add(btn).clicked() {
+                                            ctrl.is_paused.store(!is_paused, Ordering::Relaxed);
+                                        }
+                                        
+                                        ui.scope(|ui| {
+                                            ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_rgb(209, 231, 221);
+                                            ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_rgb(163, 207, 187);
+                                            ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_rgb(117, 183, 152);
+                                            ui.visuals_mut().widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(15, 81, 50);
+                                            ui.visuals_mut().widgets.hovered.fg_stroke.color = egui::Color32::from_rgb(15, 81, 50);
 
-                                                    let mut interval_val = ctrl.interval_sec.load(Ordering::Relaxed);
-                                                    ui.add(egui::DragValue::new(&mut interval_val).speed(1).suffix(" s").prefix("Interval: "));
-                                                    ctrl.interval_sec.store(interval_val, Ordering::Relaxed);
-                                                });
-
-                                                // 3. Filter
-                                                let mut filter_val = ctrl.filter_elapsed_ms.load(Ordering::Relaxed);
-                                                ui.add(egui::DragValue::new(&mut filter_val).speed(100).suffix(" ms").prefix("Filter > "));
-                                                ctrl.filter_elapsed_ms.store(filter_val, Ordering::Relaxed);
-                                                
-                                                // 4. Alert
-                                                let mut alert_val = ctrl.alert_elapsed_ms.load(Ordering::Relaxed);
-                                                ui.add(egui::DragValue::new(&mut alert_val).speed(100).suffix(" ms").prefix("Alert > "));
-                                                ctrl.alert_elapsed_ms.store(alert_val, Ordering::Relaxed);
-
-                                                // 5. Worker Alert
-                                                let mut worker_alert_val = ctrl.alert_worker_percent.load(Ordering::Relaxed);
-                                                ui.add(egui::DragValue::new(&mut worker_alert_val).speed(1).clamp_range(1..=100).suffix(" %").prefix("Worker Alert > "));
-                                                ctrl.alert_worker_percent.store(worker_alert_val, Ordering::Relaxed);
-                                            });
+                                            let mut interval_val = ctrl.interval_sec.load(Ordering::Relaxed);
+                                            ui.add(egui::DragValue::new(&mut interval_val).speed(1).suffix(" s").prefix("Interval: "));
+                                            ctrl.interval_sec.store(interval_val, Ordering::Relaxed);
                                         });
+
+                                        let mut filter_val = ctrl.filter_elapsed_ms.load(Ordering::Relaxed);
+                                        ui.add(egui::DragValue::new(&mut filter_val).speed(100).suffix(" ms").prefix("Filter > "));
+                                        ctrl.filter_elapsed_ms.store(filter_val, Ordering::Relaxed);
+                                        
+                                        let mut alert_val = ctrl.alert_elapsed_ms.load(Ordering::Relaxed);
+                                        ui.add(egui::DragValue::new(&mut alert_val).speed(100).suffix(" ms").prefix("Alert > "));
+                                        ctrl.alert_elapsed_ms.store(alert_val, Ordering::Relaxed);
+
+                                        let mut worker_alert_val = ctrl.alert_worker_percent.load(Ordering::Relaxed);
+                                        ui.add(egui::DragValue::new(&mut worker_alert_val).speed(1).clamp_range(1..=100).suffix(" %").prefix("Worker Alert > "));
+                                        ctrl.alert_worker_percent.store(worker_alert_val, Ordering::Relaxed);
+
+                                        let mut snap_val = ctrl.requests_snapshot.load(Ordering::Relaxed);
+                                        ui.add(egui::DragValue::new(&mut snap_val).speed(1).prefix("Req. Snap > "));
+                                        ctrl.requests_snapshot.store(snap_val, Ordering::Relaxed);
+
+                                        let mut is_snap_paused = ctrl.pause_snapshot.load(Ordering::Relaxed);
+                                        if ui.toggle_value(&mut is_snap_paused, "⏸ 暫停快照").changed() {
+                                            ctrl.pause_snapshot.store(is_snap_paused, Ordering::Relaxed);
+                                        }
                                     });
 
                                     ui.separator();
@@ -366,12 +455,12 @@ impl eframe::App for MonitorApp {
                                         .striped(true)
                                         .resizable(true)
                                         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                                        .column(Column::initial(55.0).at_least(55.0))  
-                                        .column(Column::initial(40.0).at_least(40.0))  
-                                        .column(Column::initial(60.0).at_least(60.0))  
-                                        .column(Column::initial(80.0).at_least(80.0))  
-                                        .column(Column::initial(180.0).at_least(100.0)) 
-                                        .column(Column::remainder().at_least(100.0))   
+                                        .column(Column::initial(45.0).at_least(45.0))  
+                                        .column(Column::initial(40.0).at_least(35.0))  
+                                        .column(Column::initial(50.0).at_least(45.0))  
+                                        .column(Column::initial(60.0).at_least(50.0))  
+                                        .column(Column::initial(100.0).at_least(80.0)) 
+                                        .column(Column::remainder().at_least(60.0))   
                                         .min_scrolled_height(body_height) 
                                         .max_scroll_height(body_height)
                                         .header(header_height, |mut header| {
