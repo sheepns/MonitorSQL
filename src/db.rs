@@ -148,7 +148,7 @@ pub async fn monitor_server(
                                 session.elapsed_time_ms = elapsed;
                                 session.status = row.try_get::<&str, _>("status").unwrap_or(Some("")).unwrap_or("").trim().to_string();
                                 session.wait_type = row.try_get::<&str, _>("wait_type").unwrap_or(Some("")).unwrap_or("").trim().to_string();
-                                session.wait_time_ms = row.try_get::<i64, _>("wait_time").unwrap_or(Some(0)).unwrap_or(0);
+                                session.wait_time_ms = row.try_get::<i32, _>("wait_time").unwrap_or(Some(0)).unwrap_or(0) as i64;
                                 session.last_wait_type = row.try_get::<&str, _>("last_wait_type").unwrap_or(Some("")).unwrap_or("").trim().to_string();
                                 session.wait_resource = row.try_get::<&str, _>("wait_resource").unwrap_or(Some("")).unwrap_or("").trim().to_string();
                                 session.wait_session_id = row.try_get::<i16, _>("blocking_session_id").unwrap_or(Some(0)).unwrap_or(0);
