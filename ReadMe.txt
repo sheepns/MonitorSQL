@@ -1,10 +1,11 @@
-此監控系統可以查看SQL Server的:
+此監控系統為運作於Windows上的desktop程式，可以查看SQL Server的:
     session執行狀況
     worker thread使用量
     連線數(Conns)
     資料頁面停留於記憶體的時間(PLE, page life expectancy)
     暫存table的數量(Temp Tbls)
     開啟的交易數量(Trans)
+    當前執行中的Request Session數量
 
 
 同時最多可以監控4台主機(可重複，四個監控都可以指向同一台)
@@ -18,13 +19,36 @@
     設定執行時間超過多久會跳出提醒並且寫入alert log。(alert_elapsed_ms)
     設定資料更新頻率(default_interval_sec)
     設定worker使用量大於多少百分比會告警(alert_worker_percent)
-
+    設定自動記錄snapshot的session數量閥值 (snapshot_sessions)
+    設定該機器預設是否會自動記錄snapshot (pause_snapshot)
 
 上述設定除了寫在config檔中，也可於程式執行期間於介面上動態修改。
 
+可修改參數或功能:
+    暫停監控      --  停止對目標主機發送監控查詢，同時也不進行log紀錄。
+    Interval      --  設定每次查詢間隔，單位為"秒"
+    Filter        --  設定要顯示在下方的session需要執行時間超過多少ms才進行顯示(不影響上方的Req. Sessions數量統計)
+    Alert         --  當Session執行時間超過多少秒會被自動記錄到alert log。
+    Worker Alert  --  設定active worker數量超過多少最大數量的百分比時，記錄一筆近alert log。
+    Req. Snap     --  設定當Req. Sessions的數量超過多少條時，自動寫入snapshot log。
+    暫停快照      --  監控持續，但當Req. Sessions大於Req. Snap設定的閥值時，不會寫Snapshot Log。
+
+
+
 每台主機顯示執行時間最長的前10條session，對於每條session可以點"詳細"，去看更多的細節。
 
-Log會產生在與監控程式相同目錄下，名稱為:alert_query.log
+
+執行過程中，會自動記錄log，log有兩種，分別為
+    alert log  --- 執行時間超過該主機設定值(Alert)的session
+    snapshot log  --- 當該主機當下同時執行的request sessions > 設定值(Req. Snap)。可藉由點選"暫停快照"停止自動記錄
+
+Snapshot log除了會自動記錄外，也可手動點擊"快照"進行記錄。
+
+Log會產生在與監控程式相同目錄下，名稱為:alert_log_YYYYMMDD.log以及snapshot_log_YYYYMMDD.log。
+
+此兩log可以分別使用AlertLogViewer.exe/SnapshotViewer.exe進行讀取，開啟後將log拖曳到程式中即可。
+
+
 
 
 --------
@@ -40,6 +64,11 @@ MonitorSQL/
     ├── app.rs               # 5. UI 畫面與背景監控任務邏輯
     └── db.rs                # 6. SQL Server 連線與 T-SQL 查詢處理
 
+
+AlertLogViewer/
+├── Cargo.toml               # 1. 專案依賴套件設定
+└── src/
+    └── main.rs              # 2. 程式入口與 GUI 啟動
 
 --------
 編譯方式
